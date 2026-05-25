@@ -587,7 +587,7 @@ fn load_conv<'a, I: Iterator<Item = &'a usize> + Sized>(
     _iter: &mut Peekable<I>,
 ) -> Result<(NodeId, CustomNode)> {
     let conv_node = downcast_to::<Conv>(node)?;
-    let input_padding = check_conv2d_attributes(conv_node)?;
+    let (input_padding, stride) = check_conv2d_attributes(conv_node)?;
     // TODO: support for conv without bias
     ensure_onnx!(
         node.inputs.len() == 3,
@@ -606,9 +606,10 @@ fn load_conv<'a, I: Iterator<Item = &'a usize> + Sized>(
         // it's a convolution layer without bias
         let mut c = Convolution::new_without_bias(filter_const);
         c.input_padding = input_padding;
+        c.stride = stride;
         c
     } else {
-        Convolution::new_with_padding(filter_const, bias_const, input_padding)
+        Convolution::new_with_padding_and_stride(filter_const, bias_const, input_padding, stride)
     };
     let provable_node = crate::layers::provable::Node::new(
         vec![Edge::new(input_link.node, input_link.slot)],
@@ -646,14 +647,34 @@ fn get_node_output_shape(node: &OnnxNode, output_idx: usize) -> Result<Shape> {
 }
 
 /// Get the conv2d attributes and assert if supported by DeepProve.
-/// Returns the spatial input padding `[pad_h, pad_w]` extracted from ONNX `pads`.
+/// Returns `([pad_h, pad_w], [stride_h, stride_w])` extracted from ONNX attributes.
 ///
-/// Supported: symmetric padding (pad_begin == pad_end) with equal H and W pads.
-fn check_conv2d_attributes(node: &Conv) -> Result<[usize; 2]> {
+/// Supported: symmetric padding (pad_begin == pad_end) with equal H and W pads;
+/// equal square strides (stride_h == stride_w) that are a power of two.
+fn check_conv2d_attributes(node: &Conv) -> Result<([usize; 2], [usize; 2])> {
     let Some(ref strides) = node.pool_spec.strides else {
         return err(format!("Conv has no strides: {}", node.name()));
     };
-    ensure_onnx!(strides.iter().all(|&x| x == 1), "Strides must be {}", 1);
+    ensure_onnx!(
+        strides.len() == 2,
+        "Conv {} strides must be 2-D: {:?}",
+        node.name(),
+        strides
+    );
+    ensure_onnx!(
+        strides[0] == strides[1],
+        "Conv {} strides must be square (stride_h == stride_w): {:?}",
+        node.name(),
+        strides
+    );
+    let stride_val = strides[0];
+    ensure_onnx!(
+        stride_val.is_power_of_two(),
+        "Conv {} stride must be a power of two for ZK proving: {}",
+        node.name(),
+        stride_val
+    );
+    let stride = [stride_val, stride_val];
     let input_padding = match &node.pool_spec.padding {
         PaddingSpec::Explicit(pad0, pad1) => {
             // pad0 = begin pads [pad_h, pad_w], pad1 = end pads [pad_h, pad_w]
@@ -716,7 +737,7 @@ fn check_conv2d_attributes(node: &Conv) -> Result<[usize; 2]> {
         node.name(),
         kernel_shape
     );
-    Ok(input_padding)
+    Ok((input_padding, stride))
 }
 
 fn err<T>(msg: String) -> Result<T> {

@@ -62,6 +62,15 @@ pub struct Convolution<T> {
     /// Default is [0, 0] (valid / no-padding convolution).
     #[serde(default)]
     pub input_padding: [usize; 2],
+    /// Spatial stride applied to H and W dimensions of the output after convolution.
+    /// Equivalent to ONNX `strides` = [stride_h, stride_w].
+    /// Default is [1, 1] (unstrided convolution).
+    #[serde(default = "default_stride")]
+    pub stride: [usize; 2],
+}
+
+fn default_stride() -> [usize; 2] {
+    [1, 1]
 }
 
 /// Info about the convolution layer derived during the setup phase
@@ -85,6 +94,9 @@ pub struct ConvCtx<E> {
     /// Spatial zero-padding applied to input before convolution; mirrors `Convolution::input_padding`.
     #[serde(default)]
     pub input_padding: [usize; 2],
+    /// Spatial stride; mirrors `Convolution::stride`.
+    #[serde(default = "default_stride")]
+    pub stride: [usize; 2],
 }
 
 pub fn to_bits<E: ExtensionField>(mut num: usize, bitlen: usize) -> Vec<E> {
@@ -145,6 +157,25 @@ impl<T: Number> Convolution<T> {
             bias,
             unpadded_shape: filter_shape,
             input_padding,
+            stride: [1, 1],
+        }
+    }
+
+    pub fn new_with_padding_and_stride(
+        filter: Tensor<T>,
+        bias: Tensor<T>,
+        input_padding: [usize; 2],
+        stride: [usize; 2],
+    ) -> Self {
+        assert_eq!(filter.kw(), bias.get_shape()[0]);
+        assert_eq!(filter.get_shape().len(), 4);
+        let filter_shape = filter.get_shape();
+        Self {
+            filter,
+            bias,
+            unpadded_shape: filter_shape,
+            input_padding,
+            stride,
         }
     }
 
@@ -160,18 +191,30 @@ impl<T: Number> Convolution<T> {
             bias,
             unpadded_shape: unpadded_shape.clone(),
             input_padding: [0, 0],
+            stride: [1, 1],
         }
     }
     pub fn output_shape(&self, input_shape: &Shape, padding_mode: PaddingMode) -> Shape {
         let [ph, pw] = self.input_padding;
+        let [sh, sw] = self.stride;
         match padding_mode {
             // unpadded shape is the shape found in onxx file for example
-            PaddingMode::NoPadding => {
-                conv2d_shape_with_padding(input_shape, &self.unpadded_shape, ph, pw)
-            }
-            PaddingMode::Padding => {
-                padded_conv2d_shape_with_padding(input_shape, &self.filter.real_shape(), ph, pw)
-            }
+            PaddingMode::NoPadding => conv2d_shape_with_padding_and_stride(
+                input_shape,
+                &self.unpadded_shape,
+                ph,
+                pw,
+                sh,
+                sw,
+            ),
+            PaddingMode::Padding => padded_conv2d_shape_with_padding_and_stride(
+                input_shape,
+                &self.filter.real_shape(),
+                ph,
+                pw,
+                sh,
+                sw,
+            ),
         }
     }
 
@@ -272,11 +315,13 @@ impl Evaluate<f32> for Convolution<f32> {
         );
         let input = inputs[0];
         let [ph, pw] = self.input_padding;
+        let [sh, sw] = self.stride;
+        assert_eq!(sh, sw, "only square strides are supported");
         let padded = input.zero_pad_spatial(ph, pw);
         Ok(LayerOut::from_vec(vec![padded.conv2d(
             &self.filter,
             &self.bias,
-            1,
+            sh,
         )]))
     }
 }
@@ -290,13 +335,16 @@ impl Convolution<f32> {
         let bias = self.bias.quantize(bias_s);
         let mut q = Convolution::<Element>::new(quantized_filter, bias);
         q.input_padding = self.input_padding;
+        q.stride = self.stride;
         q
     }
 
     pub fn op<E: ExtensionField>(&self, input: &Tensor<f32>) -> Tensor<f32> {
         let [ph, pw] = self.input_padding;
+        let [sh, sw] = self.stride;
+        assert_eq!(sh, sw, "only square strides are supported");
         let padded = input.zero_pad_spatial(ph, pw);
-        padded.conv2d(&self.filter, &self.bias, 1)
+        padded.conv2d(&self.filter, &self.bias, sh)
     }
 
     pub fn max_abs_weight(&self) -> f32 {
@@ -383,6 +431,8 @@ impl Convolution<Element> {
         //   3. Re-apply POT padding for the FFT
         // When there is no ONNX padding the input is used as-is.
         let [ph, pw] = self.input_padding;
+        let [sh, sw] = self.stride;
+        assert_eq!(sh, sw, "only square strides are supported");
         let fft_input: Tensor<Element> = if ph == 0 && pw == 0 {
             input.clone()
         } else {
@@ -394,28 +444,47 @@ impl Convolution<Element> {
         };
         let (output, mut proving_data) = self.filter.fft_conv(&fft_input);
         let conv_output = self.add_bias(&output);
-        // we record here the output _after_ the bias addition. During proving it's necessary since we're proving the clearing garbage
-        // and that produces a new claim on this output.
+        // we record here the full-resolution output _after_ the bias addition.
+        // For strided conv, this is the full-res (unstrided) output.
+        // The prover needs these values to reconstruct conv_after_bias for the clearing hadamard proof.
         proving_data.set_output(conv_output.get_data());
-        // At this stage, we're creating a "garbage clearing" tensor that sets all garbage values to 0. This is necessary
-        // since the garbage might be of any value and we need to restrict the range of the output due to requantization proving logic.
+        // At this stage, we're creating a "garbage clearing" tensor that sets all garbage values to 0.
+        // This also zeroes non-stride-multiple positions so that the prover's claim on the
+        // full-res output is consistent with the strided output delivered downstream.
         let effective_unpadded_input = self.effective_input_shape(unpadded_input_shape);
-        let unpadded_output_shape = conv2d_shape(&effective_unpadded_input, &self.unpadded_shape);
+        // Full-resolution (unstrided) valid output shape
+        let full_unpadded_output_shape =
+            conv2d_shape(&effective_unpadded_input, &self.unpadded_shape);
         debug_assert_eq!(
             { padded_conv2d_shape(&fft_input.get_shape(), &self.filter.real_shape(),) },
             conv_output.get_shape(),
             "FFT output shape not computable"
         );
-        let cleared_tensor = clear_garbage(&conv_output, &unpadded_output_shape);
-        debug_assert!({
-            // check that applying the clearing tensor to the conv output gives the same result - as we'd be using the clearing tensor
-            // for proving
-            let clearing_tensor =
-                new_clearing_tensor(&unpadded_output_shape, &conv_output.get_shape());
-            let cleared_tensor2 = conv_output.flatten().mul(&clearing_tensor);
-            cleared_tensor.get_data() == cleared_tensor2.get_data()
-        });
-        (cleared_tensor, proving_data)
+
+        if sh == 1 {
+            // No stride: original path.
+            let cleared_tensor = clear_garbage(&conv_output, &full_unpadded_output_shape);
+            debug_assert!({
+                let clearing_tensor =
+                    new_clearing_tensor(&full_unpadded_output_shape, &conv_output.get_shape());
+                let cleared_tensor2 = conv_output.flatten().mul(&clearing_tensor);
+                cleared_tensor.get_data() == cleared_tensor2.get_data()
+            });
+            (cleared_tensor, proving_data)
+        } else {
+            // Strided path:
+            //   1. Clear the full-res FFT output (zero out garbage AND non-stride positions)
+            //   2. Compact into the strided shape [C, H/s, W/s] and POT-pad
+            //
+            // The full-res cleared tensor (with zeros at non-stride positions) is what the
+            // conv proving circuit sees — it proves that the clearing hadamard is correct.
+            // The strided compact tensor is what the downstream layers receive.
+            let cleared_tensor =
+                clear_garbage_strided(&conv_output, &full_unpadded_output_shape, sh);
+            // Compact the strided values into shape [C, H_s, W_s] and POT-pad
+            let strided_compact = compact_strided(&cleared_tensor, &full_unpadded_output_shape, sh);
+            (strided_compact, proving_data)
+        }
     }
 
     /// Returns the min and max output range of the convolution layer for a given input range.
@@ -545,6 +614,17 @@ where
     fn step_info(&self, id: NodeId, mut aux: ContextAux) -> Result<(LayerCtx<E>, ContextAux)> {
         let mut filter_shape = self.filter.get_shape();
         filter_shape.remove(1);
+        // For strided convolutions the downstream layers receive the compact strided output.
+        // Adjust the spatial dims in last_output_shape accordingly.
+        let [sh, sw] = self.stride;
+        assert_eq!(sh, sw, "only square strides are supported");
+        if sh > 1 {
+            // filter_shape is [kw, nw, nw] where nw is POT-padded spatial dim.
+            // The strided output has [kw, (nw/sh).next_power_of_two(), (nw/sw).next_power_of_two()].
+            let strided_nw = (filter_shape[1] / sh).next_power_of_two();
+            filter_shape[1] = strided_nw;
+            filter_shape[2] = strided_nw;
+        }
         aux.last_output_shape
             .iter_mut()
             .for_each(|shape| *shape = filter_shape.clone());
@@ -600,6 +680,7 @@ where
             unpadded_filter_shape: self.unpadded_shape.clone(),
             padded_filter_shape: self.filter.real_shape(),
             input_padding: self.input_padding,
+            stride: self.stride,
         });
 
         let filter_poly = self.filter.pad_next_power_of_two().get_data().to_vec();
@@ -788,29 +869,77 @@ impl Convolution<Element> {
         // This results in two claims: one for the non-cleared tensor and one for the clearing tensor (only 1s and 0s)
         // The non-cleared tensor claim gets passed to the main regular logic of convolution
         // The clearing tensor one gets stored in the proof and will be checked manually by the verifier (CURRENTLY)
-        let clearing_tensor = new_clearing_tensor(unpadded_output_shape, &output.get_shape());
-        // Take the elements BEFORE bias addition - this is what the rest of the convolution proving step expects.
-        // TODO: could trade off less memory by directly recomputing it from conv data with the input shape as well.
-        let conv_after_bias =
-            Tensor::new(output.get_shape(), proving_data.output_as_element.clone());
-        debug_assert!({
-            info!(
-                "PROVE: conv_after_bias.shape(): {:?}",
-                conv_after_bias.get_shape()
+        //
+        // For stride > 1:
+        //   - `output` is the compact strided tensor [C, H_s_pot, W_s_pot]
+        //   - `proving_data.output_as_element` holds the full-res conv output [C*H_full_pot*W_full_pot]
+        //   - `last_claim.point` is a claim about the strided output MLE
+        //   We expand the claim point to the full-res space (free MLE coordinate map),
+        //   then run the clearing hadamard proof on the full-res output and a stride-aware clearing tensor.
+        let [sh, sw] = info.stride;
+        assert_eq!(sh, sw, "only square strides supported");
+        let (hadamard_claim, clearing_tensor, conv_after_bias) = if sh == 1 {
+            // No stride: original path.
+            let clearing_tensor = new_clearing_tensor(unpadded_output_shape, &output.get_shape());
+            let conv_after_bias =
+                Tensor::new(output.get_shape(), proving_data.output_as_element.clone());
+            debug_assert!({
+                info!(
+                    "PROVE: conv_after_bias.shape(): {:?}",
+                    conv_after_bias.get_shape()
+                );
+                info!(
+                    "PROVE: conv_after_bias.data(): {:?}",
+                    &conv_after_bias.get_data()[..30]
+                );
+                info!("PROVE: unpadded_output_shape: {unpadded_output_shape:?}");
+                info!("PROVE: output.shape(): {:?}", output.get_shape());
+                let cleared_out = conv_after_bias.flatten().mul(&clearing_tensor);
+                let fielded: Tensor<E> = cleared_out.to_fields();
+                fielded.get_data().to_vec() == output.get_data()
+            });
+            (last_claim.clone(), clearing_tensor, conv_after_bias)
+        } else {
+            // Strided path:
+            //
+            // The compact strided output has shape [C_pot, H_s_pot, W_s_pot].
+            // The last_claim.point has log2(C_pot * H_s_pot * W_s_pot) bits.
+            //
+            // We expand the claim point to the full-res space [C_pot, H_full_pot, W_full_pot].
+            // The full-res output was stored in proving_data.output_as_element before compaction.
+            //
+            // Expand point: prepend log2(stride) zero bits to each spatial dimension.
+            let strided_shape = output.get_shape(); // [C_pot, H_s_pot, W_s_pot]
+            let c_pot = strided_shape[0];
+            let h_s_pot = strided_shape[1];
+            let w_s_pot = strided_shape[2];
+            // Full-res POT shape dimensions
+            let h_full_pot = h_s_pot * sh; // since H_full_pot = H_s_pot * stride for POT dims
+            let w_full_pot = w_s_pot * sw;
+            let full_padded_shape = Shape::new(vec![c_pot, h_full_pot, w_full_pot]);
+
+            // Expand the claim point from strided → full-res
+            let r_full = expand_strided_point(&last_claim.point, c_pot, h_s_pot, w_s_pot, sh);
+            let expanded_claim = Claim::new(r_full, last_claim.eval);
+
+            // The strided valid shape tells us how many valid strided positions exist
+            // unpadded_output_shape is the strided valid shape [C, H_s, W_s]
+            let clearing_tensor =
+                new_clearing_tensor_strided(unpadded_output_shape, &full_padded_shape, sh);
+            let conv_after_bias = Tensor::new(
+                full_padded_shape.clone(),
+                proving_data.output_as_element.clone(),
             );
-            info!(
-                "PROVE: conv_after_bias.data(): {:?}",
-                &conv_after_bias.get_data()[..30]
+            debug_assert_eq!(
+                conv_after_bias.get_data().len(),
+                full_padded_shape.product(),
+                "Stride prove: full-res output size mismatch"
             );
-            info!("PROVE: unpadded_output_shape: {unpadded_output_shape:?}");
-            info!("PROVE: output.shape(): {:?}", output.get_shape());
-            let cleared_out = conv_after_bias.flatten().mul(&clearing_tensor);
-            let fielded: Tensor<E> = cleared_out.to_fields();
-            fielded.get_data().to_vec() == output.get_data()
-        });
+            (expanded_claim, clearing_tensor, conv_after_bias)
+        };
         let clearing_proof = hadamard::prove(
             prover.transcript,
-            last_claim,
+            &hadamard_claim,
             &conv_after_bias,
             &clearing_tensor,
         );
@@ -1155,13 +1284,24 @@ where
 {
     pub fn output_shape(&self, input_shape: &Shape, padding_mode: PaddingMode) -> Shape {
         let [ph, pw] = self.input_padding;
+        let [sh, sw] = self.stride;
         match padding_mode {
-            PaddingMode::NoPadding => {
-                conv2d_shape_with_padding(input_shape, &self.unpadded_filter_shape, ph, pw)
-            }
-            PaddingMode::Padding => {
-                padded_conv2d_shape_with_padding(input_shape, &self.padded_filter_shape, ph, pw)
-            }
+            PaddingMode::NoPadding => conv2d_shape_with_padding_and_stride(
+                input_shape,
+                &self.unpadded_filter_shape,
+                ph,
+                pw,
+                sh,
+                sw,
+            ),
+            PaddingMode::Padding => padded_conv2d_shape_with_padding_and_stride(
+                input_shape,
+                &self.padded_filter_shape,
+                ph,
+                pw,
+                sh,
+                sw,
+            ),
         }
     }
     pub(crate) fn verify_fft_delegation<T: Transcript<E>, PCS: PolynomialCommitmentScheme<E>>(
@@ -1239,24 +1379,68 @@ where
         // the prover commits to the tensor product and we could skip this step.
         // OR find a closed formula
         //
-        // To recreat it, we need the unpadded output shape and the real output shape.
+        // To recreate it, we need the unpadded output shape and the real output shape.
         // Account for ONNX spatial padding: the effective input is spatially larger.
         let [ph, pw] = self.input_padding;
-        let unpadded_output_shape = conv2d_shape_with_padding(
-            &shape_step.unpadded_input_shape[0],
-            &self.unpadded_filter_shape,
-            ph,
-            pw,
-        );
-        let real_output_shape = padded_conv2d_shape_with_padding(
-            &shape_step.padded_input_shape[0],
-            &self.padded_filter_shape,
-            ph,
-            pw,
-        );
-        let clearing_tensor = new_clearing_tensor(&unpadded_output_shape, &real_output_shape);
-        // now we need to verify the hadamard proof for the sumcheck part.
-        let hctx = hadamard::HadamardCtx::from_len(real_output_shape.product());
+        let [sh, sw] = self.stride;
+        assert_eq!(sh, sw, "only square strides supported");
+
+        // For stride > 1, the last_claim refers to the compact strided output MLE.
+        // Expand the claim point to the full-res space before running the hadamard proof.
+        let (hadamard_claim, clearing_tensor, hctx) = if sh == 1 {
+            let unpadded_output_shape = conv2d_shape_with_padding(
+                &shape_step.unpadded_input_shape[0],
+                &self.unpadded_filter_shape,
+                ph,
+                pw,
+            );
+            let real_output_shape = padded_conv2d_shape_with_padding(
+                &shape_step.padded_input_shape[0],
+                &self.padded_filter_shape,
+                ph,
+                pw,
+            );
+            let clearing_tensor = new_clearing_tensor(&unpadded_output_shape, &real_output_shape);
+            let hctx = hadamard::HadamardCtx::from_len(real_output_shape.product());
+            (last_claim.clone(), clearing_tensor, hctx)
+        } else {
+            // Strided case: the incoming claim is on the compact strided output.
+            // Compute the strided valid shape [C, H_s, W_s] and the full-res padded shape.
+            let strided_valid_shape = conv2d_shape_with_padding_and_stride(
+                &shape_step.unpadded_input_shape[0],
+                &self.unpadded_filter_shape,
+                ph,
+                pw,
+                sh,
+                sw,
+            );
+            // The compact POT-padded strided shape is what last_claim.point refers to.
+            let strided_pot_shape = padded_conv2d_shape_with_padding_and_stride(
+                &shape_step.padded_input_shape[0],
+                &self.padded_filter_shape,
+                ph,
+                pw,
+                sh,
+                sw,
+            );
+            let c_pot = strided_pot_shape[0];
+            let h_s_pot = strided_pot_shape[1];
+            let w_s_pot = strided_pot_shape[2];
+            // Full-res POT shape: H_full_pot = H_s_pot * stride (since both are POT)
+            let h_full_pot = h_s_pot * sh;
+            let w_full_pot = w_s_pot * sw;
+            let full_padded_shape = Shape::new(vec![c_pot, h_full_pot, w_full_pot]);
+
+            // Expand the strided claim point to full-res
+            let r_full = expand_strided_point(&last_claim.point, c_pot, h_s_pot, w_s_pot, sh);
+            let expanded_claim = Claim::new(r_full, last_claim.eval);
+
+            let clearing_tensor =
+                new_clearing_tensor_strided(&strided_valid_shape, &full_padded_shape, sh);
+            let hctx = hadamard::HadamardCtx::from_len(full_padded_shape.product());
+            (expanded_claim, clearing_tensor, hctx)
+        };
+
         let expected_v2_eval = clearing_tensor
             .to_mle_flat()
             .evaluate(proof.clearing_proof.random_point());
@@ -1265,7 +1449,7 @@ where
             &hctx,
             verifier.transcript,
             &proof.clearing_proof,
-            last_claim,
+            &hadamard_claim,
             expected_v2_eval,
         )
         .context("failure for hadamard proof")?;
@@ -1717,6 +1901,237 @@ pub fn padded_conv2d_shape_with_padding(
         .collect::<Shape>()
 }
 
+/// Like `conv2d_shape_with_padding` but also applies spatial stride.
+///
+/// `out_h = floor((h_in + 2*pad_h - kh) / stride_h) + 1`
+pub fn conv2d_shape_with_padding_and_stride(
+    input_shape: &Shape,
+    filter_shape: &Shape,
+    pad_h: usize,
+    pad_w: usize,
+    stride_h: usize,
+    stride_w: usize,
+) -> Shape {
+    if stride_h == 1 && stride_w == 1 {
+        return conv2d_shape_with_padding(input_shape, filter_shape, pad_h, pad_w);
+    }
+    let h_in = if input_shape.len() == 3 {
+        input_shape[1]
+    } else {
+        input_shape[2]
+    };
+    let w_in = if input_shape.len() == 3 {
+        input_shape[2]
+    } else {
+        input_shape[3]
+    };
+    let kh = filter_shape[2];
+    let kw = if filter_shape.len() > 3 {
+        filter_shape[3]
+    } else {
+        filter_shape[2]
+    };
+    let h_out = (h_in + 2 * pad_h - kh) / stride_h + 1;
+    let w_out = (w_in + 2 * pad_w - kw) / stride_w + 1;
+    Shape::new(vec![filter_shape[0], h_out, w_out])
+}
+
+/// Power-of-two padded variant of `conv2d_shape_with_padding_and_stride`.
+pub fn padded_conv2d_shape_with_padding_and_stride(
+    input_shape: &Shape,
+    filter_shape: &Shape,
+    pad_h: usize,
+    pad_w: usize,
+    stride_h: usize,
+    stride_w: usize,
+) -> Shape {
+    conv2d_shape_with_padding_and_stride(
+        input_shape,
+        filter_shape,
+        pad_h,
+        pad_w,
+        stride_h,
+        stride_w,
+    )
+    .into_vec()
+    .into_iter()
+    .map(|x| x.next_power_of_two())
+    .collect::<Shape>()
+}
+
+/// Zero out all positions in `output_tensor` that are either:
+/// - outside the valid (unstrided) output region `full_unpadded_shape`, OR
+/// - not at a stride-multiple position (i.e., where `h % stride != 0` or `w % stride != 0`).
+///
+/// The returned tensor has the **same shape** as `output_tensor` (full-res, POT-padded).
+/// This is the tensor passed to `prove_convolution_step` as `conv_after_bias` for the
+/// clearing hadamard proof.
+fn clear_garbage_strided<T: Number>(
+    output_tensor: &Tensor<T>,
+    unpadded_output_shape: &Shape,
+    stride: usize,
+) -> Tensor<T> {
+    let unpadded = if unpadded_output_shape.len() == 4 {
+        unpadded_output_shape.slice(1..)
+    } else {
+        unpadded_output_shape.clone()
+    };
+    let padded_shape = output_tensor.get_shape();
+    let mut data = output_tensor.get_data().to_vec();
+    for i in 0..padded_shape[0] {
+        for j in 0..padded_shape[1] {
+            for k in 0..padded_shape[2] {
+                let index = i * padded_shape[1] * padded_shape[2] + j * padded_shape[2] + k;
+                let in_valid = i < unpadded[0] && j < unpadded[1] && k < unpadded[2];
+                let is_stride_pos = j % stride == 0 && k % stride == 0;
+                if !(in_valid && is_stride_pos) {
+                    data[index] = T::default();
+                }
+            }
+        }
+    }
+    Tensor::new(padded_shape, data)
+}
+
+/// Build a stride-aware clearing tensor for use in the hadamard proof.
+///
+/// The tensor has shape `[full_C_pot * full_H_pot * full_W_pot]` (flattened) and is 1 only at
+/// `(c, j*stride, k*stride)` for valid strided output indices `(j, k)`.
+///
+/// This allows the verifier (who knows the public shapes and stride) to independently
+/// reconstruct the clearing tensor and verify the hadamard proof.
+pub fn new_clearing_tensor_strided(
+    strided_valid_shape: &Shape,
+    full_padded_shape: &Shape,
+    stride: usize,
+) -> Tensor<Element> {
+    // strided_valid_shape: [C, H_s, W_s]  (no POT-padding, no batch dim)
+    let sv = if strided_valid_shape.len() == 4 {
+        strided_valid_shape.slice(1..)
+    } else {
+        strided_valid_shape.clone()
+    };
+    assert_eq!(full_padded_shape.len(), 3);
+    assert_eq!(sv.len(), 3);
+    let n = full_padded_shape.product();
+    let mut data: Vec<Element> = vec![0; n];
+    // sv[0] = C_valid, sv[1] = H_strided_valid, sv[2] = W_strided_valid
+    for c in 0..full_padded_shape[0] {
+        for j in 0..full_padded_shape[1] {
+            for k in 0..full_padded_shape[2] {
+                let idx =
+                    c * full_padded_shape[1] * full_padded_shape[2] + j * full_padded_shape[2] + k;
+                // A position is "live" iff it corresponds to a valid strided output:
+                // j = s * h_s, k = s * w_s, where h_s < sv[1] and w_s < sv[2]
+                if c < sv[0] && j % stride == 0 && k % stride == 0 {
+                    let h_s = j / stride;
+                    let w_s = k / stride;
+                    if h_s < sv[1] && w_s < sv[2] {
+                        data[idx] = 1;
+                    }
+                }
+            }
+        }
+    }
+    Tensor::new(Shape::new(vec![n]), data)
+}
+
+/// Compact the full-res stride-cleared tensor into a `[C, H_s, W_s]` tensor (POT-padded).
+///
+/// Extracts the `(c, j*stride, k*stride)` positions from `cleared_tensor` and packs them
+/// into a contiguous array with shape `[C, H_s_pot, W_s_pot]`.
+///
+/// `full_unpadded_shape` is the full-res valid shape `[C, H, W]`.
+fn compact_strided<T: Number>(
+    cleared_tensor: &Tensor<T>,
+    full_unpadded_shape: &Shape,
+    stride: usize,
+) -> Tensor<T> {
+    let fu = if full_unpadded_shape.len() == 4 {
+        full_unpadded_shape.slice(1..)
+    } else {
+        full_unpadded_shape.clone()
+    };
+    let c_valid = fu[0];
+    let h_valid = fu[1];
+    let w_valid = fu[2];
+    // Number of strided valid output positions
+    let h_s = h_valid / stride; // floor division
+    let w_s = w_valid / stride;
+    let h_s_pot = h_s.next_power_of_two();
+    let w_s_pot = w_s.next_power_of_two();
+    let c_pot = c_valid.next_power_of_two();
+
+    let full_padded_shape = cleared_tensor.get_shape();
+    let fp_h = full_padded_shape[1];
+    let fp_w = full_padded_shape[2];
+
+    let n = c_pot * h_s_pot * w_s_pot;
+    let mut data: Vec<T> = vec![T::default(); n];
+    for c in 0..c_valid {
+        for h in 0..h_s {
+            for w in 0..w_s {
+                let src_idx = c * fp_h * fp_w + (h * stride) * fp_w + (w * stride);
+                let dst_idx = c * h_s_pot * w_s_pot + h * w_s_pot + w;
+                data[dst_idx] = cleared_tensor.get_data()[src_idx];
+            }
+        }
+    }
+    Tensor::new(Shape::new(vec![c_pot, h_s_pot, w_s_pot]), data)
+}
+
+/// Expand a strided-MLE evaluation point to a full-res-MLE evaluation point.
+///
+/// The MLE of a `[C_pot, H_s_pot, W_s_pot]` tensor is evaluated at a point with
+/// `log2(C_pot * H_s_pot * W_s_pot)` coordinates (LSB first, packed as `r_W || r_H || r_C`).
+///
+/// We expand to the full-res `[C_pot, H_full_pot, W_full_pot]` point by inserting
+/// `log2(stride)` zero coordinates at the LSB of each spatial dimension, matching the
+/// bit structure `stride*h_s` = `h_s` shifted left by `log2(stride)`.
+///
+/// This is sound: `compact.evaluate(r_s) == full_cleared.evaluate(expand(r_s))` because
+/// the full-res tensor has zeros at all non-stride positions.
+fn expand_strided_point<E: ExtensionField>(
+    r_strided: &[E],
+    c_pot: usize,
+    h_s_pot: usize,
+    w_s_pot: usize,
+    stride: usize,
+) -> Vec<E> {
+    debug_assert!(stride.is_power_of_two(), "stride must be power of two");
+    let stride_bits = stride.ilog2() as usize;
+    let log_c = c_pot.ilog2() as usize;
+    let log_ws = w_s_pot.ilog2() as usize;
+    let log_hs = h_s_pot.ilog2() as usize;
+
+    // r_strided layout (LSB first): r_W[0..log_ws] | r_H[0..log_hs] | r_C[0..log_c]
+    let r_w_s = &r_strided[..log_ws];
+    let r_h_s = &r_strided[log_ws..log_ws + log_hs];
+    let r_c = &r_strided[log_ws + log_hs..];
+    debug_assert_eq!(r_c.len(), log_c);
+
+    // Full-res layout: r_W_full[0..log_ws+stride_bits] | r_H_full[..] | r_C[..]
+    // Expand: prepend `stride_bits` zeros to each spatial dim (at the LSB end)
+    let log_wf = log_ws + stride_bits;
+    let log_hf = log_hs + stride_bits;
+
+    let mut r_full: Vec<E> = Vec::with_capacity(log_wf + log_hf + log_c);
+    // W part: [0]*stride_bits ++ r_w_s
+    for _ in 0..stride_bits {
+        r_full.push(E::ZERO);
+    }
+    r_full.extend_from_slice(r_w_s);
+    // H part: [0]*stride_bits ++ r_h_s
+    for _ in 0..stride_bits {
+        r_full.push(E::ZERO);
+    }
+    r_full.extend_from_slice(r_h_s);
+    // C part: unchanged
+    r_full.extend_from_slice(r_c);
+
+    r_full
+}
+
 #[cfg(test)]
 mod test {
     use crate::layers::{
@@ -1728,6 +2143,7 @@ mod test {
 
     use super::*;
     use ff_ext::GoldilocksExt2;
+    use p3_field::FieldAlgebra;
 
     fn split_garbage(
         fft_output: &Tensor<Element>,
@@ -2170,5 +2586,227 @@ mod test {
         };
         assert_eq!(out_h, 6, "output H must equal input H for same-conv");
         assert_eq!(out_w, 6, "output W must equal input W for same-conv");
+    }
+
+    /// Verify that the strided shape functions produce the correct output dimensions.
+    #[test]
+    fn test_strided_shape_functions() {
+        // input [1, 8, 8], kernel 3x3, stride 2, no padding → out = (8-3)/2+1 = 3
+        let input_shape: Shape = vec![1, 8, 8].into();
+        let filter_shape: Shape = vec![4, 1, 3, 3].into();
+        let out = conv2d_shape_with_padding_and_stride(&input_shape, &filter_shape, 0, 0, 2, 2);
+        assert_eq!(out, Shape::new(vec![4, 3, 3]));
+
+        // POT-padded version: 3 → next_pow2 = 4
+        let out_pot =
+            padded_conv2d_shape_with_padding_and_stride(&input_shape, &filter_shape, 0, 0, 2, 2);
+        assert_eq!(out_pot, Shape::new(vec![4, 4, 4]));
+
+        // stride=1 should equal no-stride version
+        let out1 = conv2d_shape_with_padding_and_stride(&input_shape, &filter_shape, 0, 0, 1, 1);
+        let out_ns = conv2d_shape_with_padding(&input_shape, &filter_shape, 0, 0);
+        assert_eq!(out1, out_ns);
+    }
+
+    /// Verify that `clear_garbage_strided` zeroes out non-stride positions and garbage,
+    /// and `compact_strided` produces a tensor whose values equal stride-indexed positions.
+    #[test]
+    fn test_clear_and_compact_strided() {
+        // Full-res output shape: [2, 8, 8] (POT-padded; valid region [2, 6, 6])
+        let full_padded_shape: Shape = vec![2, 8, 8].into();
+        let full_valid_shape: Shape = vec![2, 6, 6].into();
+        let tensor: Tensor<Element> = Tensor::random(&full_padded_shape);
+        let stride = 2;
+
+        let cleared = clear_garbage_strided(&tensor, &full_valid_shape, stride);
+
+        // Verify: positions (c, j, k) with j%2!=0 or k%2!=0 or j>=6 or k>=6 must be 0
+        for c in 0..2usize {
+            for j in 0..8usize {
+                for k in 0..8usize {
+                    let idx = c * 64 + j * 8 + k;
+                    let val = cleared.get_data()[idx];
+                    let should_be_nonzero = c < 2 && j < 6 && k < 6 && j % 2 == 0 && k % 2 == 0;
+                    if !should_be_nonzero {
+                        assert_eq!(val, 0, "Expected 0 at ({c},{j},{k}) but got {val}");
+                    } else {
+                        // should equal the original tensor at that position
+                        assert_eq!(val, tensor.get_data()[idx]);
+                    }
+                }
+            }
+        }
+
+        // Compact: valid strided dims = 6/2=3 each, POT-padded to 4
+        let compact = compact_strided(&cleared, &full_valid_shape, stride);
+        assert_eq!(compact.get_shape(), Shape::new(vec![2, 4, 4]));
+        // Check that compact[c, h, w] == original[c, 2h, 2w] for h,w < 3
+        for c in 0..2usize {
+            for h in 0..3usize {
+                for w in 0..3usize {
+                    let src = tensor.get_data()[c * 64 + (h * 2) * 8 + (w * 2)];
+                    let dst = compact.get_data()[c * 16 + h * 4 + w];
+                    assert_eq!(src, dst, "compact mismatch at ({c},{h},{w})");
+                }
+            }
+        }
+    }
+
+    /// Verify the MLE identity: compact_output.evaluate(r_s) == full_cleared.evaluate(expand(r_s)).
+    /// This is the key soundness property for the strided clearing hadamard proof.
+    #[test]
+    fn test_expand_strided_point_mle_identity() {
+        use multilinear_extensions::mle::MultilinearExtension;
+        type E = GoldilocksExt2;
+
+        // Build a small strided output
+        // full-res valid [2, 4, 4], stride=2 → compact valid [2, 2, 2], POT→ compact [2, 2, 2]
+        let full_valid: Shape = vec![2, 4, 4].into();
+        let full_pot: Shape = vec![2, 4, 4].into(); // already POT
+        let stride = 2;
+
+        // Create tensor with known values at stride positions
+        let mut data = vec![0i64; 2 * 4 * 4];
+        // Set values at stride-multiple positions
+        for c in 0..2usize {
+            for h in 0..2usize {
+                for w in 0..2usize {
+                    let val = (c * 4 + h * 2 + w + 1) as i64;
+                    data[c * 16 + (h * 2) * 4 + (w * 2)] = val;
+                }
+            }
+        }
+        let full_tensor: Tensor<Element> = Tensor::new(full_pot.clone(), data);
+
+        // Build the compact strided tensor
+        let compact = compact_strided(&full_tensor, &full_valid, stride);
+
+        // Choose a random point in the strided space
+        let c_pot = compact.get_shape()[0]; // 2
+        let h_s_pot = compact.get_shape()[1]; // 2
+        let w_s_pot = compact.get_shape()[2]; // 2
+        let log_c = c_pot.ilog2() as usize; // 1
+        let log_hs = h_s_pot.ilog2() as usize; // 1
+        let log_ws = w_s_pot.ilog2() as usize; // 1
+        let total_bits = log_ws + log_hs + log_c; // 3
+
+        // Use a simple deterministic "random" point
+        let r_s: Vec<E> = (0..total_bits)
+            .map(|i| {
+                E::from_canonical_u64(match i {
+                    0 => 3, // r_W bit
+                    1 => 7, // r_H bit
+                    2 => 2, // r_C bit
+                    _ => i as u64,
+                })
+            })
+            .collect();
+
+        // Convert Element tensors to field tensors for MLE evaluation
+        let compact_fields: Tensor<E> = compact.to_fields();
+        let full_fields: Tensor<E> = full_tensor.to_fields();
+
+        // Evaluate compact MLE at r_s
+        let compact_eval: E = compact_fields.get_data().to_vec().into_mle().evaluate(&r_s);
+
+        // Expand point and evaluate full-res MLE
+        let r_full = expand_strided_point::<E>(&r_s, c_pot, h_s_pot, w_s_pot, stride);
+        let full_eval: E = full_fields.get_data().to_vec().into_mle().evaluate(&r_full);
+
+        assert_eq!(
+            compact_eval, full_eval,
+            "MLE identity failed: compact.evaluate(r_s) != full_cleared.evaluate(expand(r_s))"
+        );
+    }
+
+    /// Verify that the new_clearing_tensor_strided marks exactly the stride positions.
+    #[test]
+    fn test_new_clearing_tensor_strided() {
+        // valid strided [2, 3, 3], full padded [2, 8, 8], stride=2
+        // stride positions: (c, j*2, k*2) for j<3, k<3, c<2
+        let strided_valid: Shape = vec![2, 3, 3].into();
+        let full_padded: Shape = vec![2, 8, 8].into();
+        let t = new_clearing_tensor_strided(&strided_valid, &full_padded, 2);
+        // Should have product(full_padded) elements
+        assert_eq!(t.get_data().len(), 2 * 8 * 8);
+        let data = t.get_data();
+        for c in 0..2usize {
+            for j in 0..8usize {
+                for k in 0..8usize {
+                    let idx = c * 64 + j * 8 + k;
+                    let expected = if c < 2 && j % 2 == 0 && k % 2 == 0 {
+                        let h_s = j / 2;
+                        let w_s = k / 2;
+                        if h_s < 3 && w_s < 3 { 1 } else { 0 }
+                    } else {
+                        0
+                    };
+                    assert_eq!(data[idx], expected, "Wrong value at ({c},{j},{k})");
+                }
+            }
+        }
+    }
+
+    /// f32 path: verify that a Convolution with stride=2 produces the same result as
+    /// manually applying an unstrided conv and then picking every 2nd element.
+    #[test]
+    fn test_strided_conv_f32_path() {
+        let input_shape: Shape = vec![1, 8, 8].into();
+        let filter_shape: Shape = vec![2, 1, 3, 3].into(); // 2 out-channels, 3x3 kernel
+
+        let filter: Tensor<f32> = Tensor::random(&filter_shape);
+        let bias: Tensor<f32> = Tensor::zeros(vec![filter_shape[0]].into());
+        let input: Tensor<f32> = Tensor::random(&input_shape);
+
+        // Strided conv via Convolution::new_with_padding_and_stride
+        let conv_strided =
+            Convolution::new_with_padding_and_stride(filter.clone(), bias.clone(), [0, 0], [2, 2]);
+        let out_strided = conv_strided.op::<GoldilocksExt2>(&input);
+
+        // Reference: unstrided conv, then manually pick positions 0, 2, 4, ...
+        let out_full = input.conv2d(&filter, &bias, 1);
+        // out_full shape: [2, 6, 6] (8-3+1=6 for stride=1 without padding)
+        // strided output should be [2, 3, 3] (6/2=3)
+        // Shape may have a leading batch dimension of 1 — remove it for comparison
+        let out_shape = out_strided.get_shape();
+        let out_shape_nobatch = if out_shape[0] == 1 && out_shape.len() == 4 {
+            out_shape.slice(1..)
+        } else {
+            out_shape.clone()
+        };
+        assert_eq!(
+            out_shape_nobatch,
+            Shape::new(vec![2, 3, 3]),
+            "strided output shape"
+        );
+
+        // Verify values match stride-sampled positions of full-res output
+        let full_data = out_full.get_data();
+        let strided_data = out_strided.get_data();
+        // out_full shape may have a batch dim — find (c, h, w) offsets
+        let full_shape = out_full.get_shape();
+        let (c_out, h_full, w_full) = if full_shape.len() == 4 {
+            (full_shape[1], full_shape[2], full_shape[3])
+        } else {
+            (full_shape[0], full_shape[1], full_shape[2])
+        };
+        let strided_shape = if out_shape.len() == 4 {
+            (out_shape[1], out_shape[2], out_shape[3])
+        } else {
+            (out_shape[0], out_shape[1], out_shape[2])
+        };
+        for c in 0..c_out {
+            for h in 0..strided_shape.1 {
+                for w in 0..strided_shape.2 {
+                    let src = full_data[c * h_full * w_full + (h * 2) * w_full + (w * 2)];
+                    let dst = strided_data
+                        [c * strided_shape.1 * strided_shape.2 + h * strided_shape.2 + w];
+                    assert!(
+                        (src - dst).abs() < 1e-5,
+                        "f32 stride mismatch at ({c},{h},{w}): src={src} dst={dst}"
+                    );
+                }
+            }
+        }
     }
 }

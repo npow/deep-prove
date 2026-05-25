@@ -100,11 +100,56 @@ where
 mod test {
     use ff_ext::GoldilocksExt2;
 
-    use crate::{default_transcript, init_test_logging_default, model::Model, testing::Pcs};
+    use crate::{
+        Element, default_transcript, init_test_logging_default,
+        layers::{Layer, convolution::Convolution},
+        model::Model,
+        padding::PaddingMode,
+        tensor::{Shape, Tensor},
+        testing::Pcs,
+    };
 
     use super::{Context, prover::Prover, verifier::verify};
 
     type F = GoldilocksExt2;
+
+    /// End-to-end ZK proof test for a strided convolution (stride=2).
+    /// Builds a model with a single stride-2 conv (4 out-ch, 3×3 kernel), runs inference,
+    /// generates a proof, and verifies it.  This validates the soundness of the
+    /// post-conv decimation circuit (full-res FFT conv + MLE point expansion + hadamard clearing).
+    #[test]
+    fn test_prover_strided_conv() {
+        init_test_logging_default();
+
+        // Input: [2 ch, 8×8] (already POT).  Kernel: [4 out, 2 in, 3×3].
+        // Stride 2 → valid out [4, 3, 3], POT-padded to [4, 4, 4].
+        let input_shape: Shape = vec![2usize, 8, 8].into();
+        let filter_shape: Shape = vec![4usize, 2, 3, 3].into();
+        let filter: Tensor<Element> = Tensor::random(&filter_shape);
+        let bias: Tensor<Element> = Tensor::zeros(vec![filter_shape[0]].into());
+
+        let stride = [2usize, 2];
+        let conv = Convolution::new_with_padding_and_stride(filter, bias, [0, 0], stride)
+            .into_padded_and_ffted(&input_shape);
+
+        let mut model =
+            Model::new_from_input_shapes(vec![input_shape.clone()], PaddingMode::Padding);
+        model
+            .add_consecutive_layer(Layer::Convolution(conv), None)
+            .expect("add conv layer");
+        model.route_output(None).expect("route output");
+
+        let input = Tensor::random(&input_shape);
+        let trace = model.run(&vec![input]).expect("model run");
+        let io = trace.to_verifier_io();
+        let ctx = Context::<F, Pcs<F>>::generate(&model, None, None).expect("generate context");
+        let mut prover_transcript = default_transcript();
+        let prover = Prover::<_, _, _>::new(&ctx, &mut prover_transcript);
+        let proof = prover.prove(trace).expect("generate proof");
+        let mut verifier_transcript = default_transcript();
+        verify::<_, _, _>(ctx, proof, io, &mut verifier_transcript)
+            .expect("verify strided conv proof");
+    }
 
     #[test]
     fn test_prover_steps_generic() {
