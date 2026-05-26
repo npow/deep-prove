@@ -97,6 +97,11 @@ pub struct ConvCtx<E> {
     /// Spatial stride; mirrors `Convolution::stride`.
     #[serde(default = "default_stride")]
     pub stride: [usize; 2],
+    /// Unpadded (pre-POT) input shape seen by this conv layer (e.g. [C, H, W] before POT padding).
+    /// Used by `verify_input_claim` to reconstruct the ONNX-spatially-padded FFT input when
+    /// `input_padding` is non-zero.  Defaults to empty (treated as "unknown / not needed").
+    #[serde(default)]
+    pub unpadded_input_shape: Shape,
 }
 
 pub fn to_bits<E: ExtensionField>(mut num: usize, bitlen: usize) -> Vec<E> {
@@ -614,20 +619,67 @@ where
     fn step_info(&self, id: NodeId, mut aux: ContextAux) -> Result<(LayerCtx<E>, ContextAux)> {
         let mut filter_shape = self.filter.get_shape();
         filter_shape.remove(1);
+        // Capture the unpadded input shape BEFORE updating aux (it is the unpadded output of the
+        // previous node, or the model's unpadded input for the first layer).
+        let unpadded_input_shape = aux
+            .last_unpadded_output_shape
+            .first()
+            .cloned()
+            .unwrap_or_default();
+
         // For strided convolutions the downstream layers receive the compact strided output.
         // Adjust the spatial dims in last_output_shape accordingly.
         let [sh, sw] = self.stride;
         assert_eq!(sh, sw, "only square strides are supported");
+        let [ph, pw] = self.input_padding;
         if sh > 1 {
-            // filter_shape is [kw, nw, nw] where nw is POT-padded spatial dim.
-            // The strided output has [kw, (nw/sh).next_power_of_two(), (nw/sw).next_power_of_two()].
-            let strided_nw = (filter_shape[1] / sh).next_power_of_two();
+            // Compute the correct compact strided output shape from the unpadded input.
+            // We cannot divide the FFT spatial dim by stride because the FFT dim is
+            // next_pow2(h_in + 2*ph) which may differ from h_s_valid * stride.
+            // (e.g. 32×32 input, padding=1 → FFT dim=64, but strided valid out = 16×16.)
+            let (strided_nw, _) = if !unpadded_input_shape.is_empty() {
+                let strided_valid = conv2d_shape_with_padding_and_stride(
+                    &unpadded_input_shape,
+                    &self.unpadded_shape,
+                    ph,
+                    pw,
+                    sh,
+                    sw,
+                );
+                // strided_valid is [C, H_s, W_s]; POT-pad the spatial dims.
+                let h_s = strided_valid[1];
+                let w_s = strided_valid[2];
+                (h_s.next_power_of_two(), w_s.next_power_of_two())
+            } else {
+                // Fallback if unpadded shape is unavailable — division may be wrong
+                // for padded convolutions but keeps backward compat for unpadded tests.
+                let nw = (filter_shape[1] / sh).next_power_of_two();
+                (nw, nw)
+            };
             filter_shape[1] = strided_nw;
             filter_shape[2] = strided_nw;
         }
         aux.last_output_shape
             .iter_mut()
             .for_each(|shape| *shape = filter_shape.clone());
+
+        // Update last_unpadded_output_shape to the unpadded strided output shape so that
+        // subsequent layers see the correct unpadded input shapes.
+        let unpadded_output_shape = if !unpadded_input_shape.is_empty() {
+            let strided_valid = conv2d_shape_with_padding_and_stride(
+                &unpadded_input_shape,
+                &self.unpadded_shape,
+                ph,
+                pw,
+                sh,
+                sw,
+            );
+            vec![strided_valid]
+        } else {
+            // Fallback: no unpadded tracking (shouldn't happen in normal usage).
+            aux.last_unpadded_output_shape.clone()
+        };
+        aux.last_unpadded_output_shape = unpadded_output_shape;
 
         let mut delegation_fft: Vec<VPAuxInfo<E>> = Vec::new();
         let mut delegation_fft_weights: Vec<VPAuxInfo<E>> = Vec::new();
@@ -681,6 +733,7 @@ where
             padded_filter_shape: self.filter.real_shape(),
             input_padding: self.input_padding,
             stride: self.stride,
+            unpadded_input_shape,
         });
 
         let filter_poly = self.filter.pad_next_power_of_two().get_data().to_vec();
@@ -839,6 +892,107 @@ where
             shape_step,
         )?])
     }
+
+    /// Override the default `verify_input_claim` to handle the case where ONNX spatial padding
+    /// (`input_padding != [0,0]`) was applied before convolution.
+    ///
+    /// The prover's final GKR claim is about `fft_input = crop(io_input) → zero_pad_spatial → POT_pad`,
+    /// but the verifier receives `io_input` = the nominal POT-padded input (without ONNX spatial padding).
+    /// When `input_padding` is non-zero we must apply the same transform to reconstruct `fft_input`.
+    fn verify_input_claim<A: AsRef<crate::tensor::Tensor<E>>>(
+        &self,
+        inputs: &[A],
+        claims: &[&crate::Claim<E>],
+    ) -> anyhow::Result<()> {
+        let [ph, pw] = self.input_padding;
+        if ph == 0 && pw == 0 {
+            // No ONNX spatial padding: default behavior — evaluate the raw POT-padded input.
+            ensure!(
+                inputs.len() == claims.len(),
+                "number of input tensors and claims must be the same"
+            );
+            for (i, (input, claim)) in inputs.iter().zip(claims).enumerate() {
+                let computed = input.as_ref().get_data().into_mle().evaluate(&claim.point);
+                ensure!(
+                    computed == claim.eval,
+                    "input claim {} is incorrect (no ONNX padding): computed {:?}, given {:?}",
+                    i,
+                    computed,
+                    claim.eval,
+                );
+            }
+            return Ok(());
+        }
+        // ONNX spatial padding present: we must reconstruct `fft_input` from the nominal input.
+        //
+        // The nominal `io_input` is POT-padded but lacks the ONNX spatial zero-rows/cols.
+        // We crop it back to the unpadded shape, apply ONNX spatial padding, then POT-pad again
+        // to match what the prover built as `fft_input`.
+        ensure!(
+            inputs.len() == claims.len(),
+            "number of input tensors and claims must be the same"
+        );
+        ensure!(
+            !self.unpadded_input_shape.is_empty(),
+            "ConvCtx.unpadded_input_shape is not set but ONNX padding is non-zero; \
+             cannot verify input claim",
+        );
+        for (i, (input, claim)) in inputs.iter().zip(claims).enumerate() {
+            // Reconstruct `fft_input` from the nominal POT-padded input.
+            // This mirrors Convolution::op when ph > 0:
+            //   1. Crop the POT-padded input to the unpadded [C, h, w] shape.
+            //   2. Zero-pad spatially by ph rows/pw cols on each side → [C, h+2ph, w+2pw].
+            //   3. POT-pad each dim to next power of two.
+            // We do this directly with field-element arithmetic to avoid the `Number` bound.
+            let nom_data = input.as_ref().get_data();
+            let nom_shape = input.as_ref().get_shape();
+            ensure!(
+                nom_shape.len() == 3,
+                "ConvCtx verify_input_claim: expected 3-D input [C,H_pot,W_pot], got {:?}",
+                nom_shape,
+            );
+            let c = self.unpadded_input_shape[0];
+            let h = self.unpadded_input_shape[1];
+            let w = self.unpadded_input_shape[2];
+            let h_pot = nom_shape[1];
+            let w_pot = nom_shape[2];
+            // Effective (ONNX-padded) shape
+            let h_eff = h + 2 * ph;
+            let w_eff = w + 2 * pw;
+            // FFT input (POT-padded) shape
+            let c_fft = c.next_power_of_two();
+            let h_fft = h_eff.next_power_of_two();
+            let w_fft = w_eff.next_power_of_two();
+            let fft_len = c_fft * h_fft * w_fft;
+            let mut fft_data = vec![E::ZERO; fft_len];
+            // Fill in the valid (non-padded) elements.
+            for ci in 0..c {
+                for hi in 0..h {
+                    for wi in 0..w {
+                        // Source: cropped from the POT-padded nominal input.
+                        let src_idx = ci * (h_pot * w_pot) + hi * w_pot + wi;
+                        // Destination: in the ONNX-spatially-padded + POT-padded tensor.
+                        let dst_hi = hi + ph;
+                        let dst_wi = wi + pw;
+                        let dst_idx = ci * (h_fft * w_fft) + dst_hi * w_fft + dst_wi;
+                        fft_data[dst_idx] = nom_data[src_idx];
+                    }
+                }
+            }
+            let computed = fft_data.into_mle().evaluate(&claim.point);
+            ensure!(
+                computed == claim.eval,
+                "input claim {} is incorrect (ONNX padding ph={} pw={}): \
+                 computed {:?}, given {:?}",
+                i,
+                ph,
+                pw,
+                computed,
+                claim.eval,
+            );
+        }
+        Ok(())
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -905,25 +1059,40 @@ impl Convolution<Element> {
             // The compact strided output has shape [C_pot, H_s_pot, W_s_pot].
             // The last_claim.point has log2(C_pot * H_s_pot * W_s_pot) bits.
             //
-            // We expand the claim point to the full-res space [C_pot, H_full_pot, W_full_pot].
+            // We expand the claim point to the full-res space [C_pot, n_x, n_x].
             // The full-res output was stored in proving_data.output_as_element before compaction.
             //
-            // Expand point: prepend log2(stride) zero bits to each spatial dimension.
+            // n_x is the actual FFT spatial dimension: next_pow2(H_in + 2*ph).
+            // IMPORTANT: n_x may be > h_s_pot * stride when ONNX padding is non-zero.
+            // We derive n_x directly from the stored full-res data length rather than
+            // assuming n_x == h_s_pot * stride.
             let strided_shape = output.get_shape(); // [C_pot, H_s_pot, W_s_pot]
             let c_pot = strided_shape[0];
             let h_s_pot = strided_shape[1];
             let w_s_pot = strided_shape[2];
-            // Full-res POT shape dimensions
-            let h_full_pot = h_s_pot * sh; // since H_full_pot = H_s_pot * stride for POT dims
-            let w_full_pot = w_s_pot * sw;
-            let full_padded_shape = Shape::new(vec![c_pot, h_full_pot, w_full_pot]);
+            // Derive the actual FFT spatial dimension from the stored full-res output data.
+            let full_res_elements = proving_data.output_as_element.len();
+            debug_assert_eq!(
+                full_res_elements % c_pot,
+                0,
+                "full-res output length must be divisible by c_pot"
+            );
+            let spatial_sq = full_res_elements / c_pot;
+            let n_x = (spatial_sq as f64).sqrt() as usize;
+            debug_assert_eq!(
+                n_x * n_x,
+                spatial_sq,
+                "full-res spatial dims must be square"
+            );
+            debug_assert!(n_x.is_power_of_two(), "n_x must be a power of two");
+            let full_padded_shape = Shape::new(vec![c_pot, n_x, n_x]);
 
-            // Expand the claim point from strided → full-res
-            let r_full = expand_strided_point(&last_claim.point, c_pot, h_s_pot, w_s_pot, sh);
+            // Expand the claim point from strided → full-res using the actual n_x.
+            let r_full = expand_strided_point(&last_claim.point, c_pot, h_s_pot, w_s_pot, n_x, sh);
             let expanded_claim = Claim::new(r_full, last_claim.eval);
 
-            // The strided valid shape tells us how many valid strided positions exist
-            // unpadded_output_shape is the strided valid shape [C, H_s, W_s]
+            // The strided valid shape tells us how many valid strided positions exist.
+            // unpadded_output_shape is the strided valid shape [C, H_s, W_s].
             let clearing_tensor =
                 new_clearing_tensor_strided(unpadded_output_shape, &full_padded_shape, sh);
             let conv_after_bias = Tensor::new(
@@ -1426,13 +1595,15 @@ where
             let c_pot = strided_pot_shape[0];
             let h_s_pot = strided_pot_shape[1];
             let w_s_pot = strided_pot_shape[2];
-            // Full-res POT shape: H_full_pot = H_s_pot * stride (since both are POT)
-            let h_full_pot = h_s_pot * sh;
-            let w_full_pot = w_s_pot * sw;
-            let full_padded_shape = Shape::new(vec![c_pot, h_full_pot, w_full_pot]);
+            // Derive the actual FFT spatial dimension n_x = next_pow2(H_in + 2*ph).
+            // IMPORTANT: n_x may be > h_s_pot * stride when ONNX padding is non-zero.
+            // We must NOT assume n_x == h_s_pot * stride.
+            let h_unpadded = shape_step.unpadded_input_shape[0][1];
+            let n_x = (h_unpadded + 2 * ph).next_power_of_two();
+            let full_padded_shape = Shape::new(vec![c_pot, n_x, n_x]);
 
-            // Expand the strided claim point to full-res
-            let r_full = expand_strided_point(&last_claim.point, c_pot, h_s_pot, w_s_pot, sh);
+            // Expand the strided claim point to full-res using the actual n_x.
+            let r_full = expand_strided_point(&last_claim.point, c_pot, h_s_pot, w_s_pot, n_x, sh);
             let expanded_claim = Claim::new(r_full, last_claim.eval);
 
             let clearing_tensor =
@@ -2085,24 +2256,58 @@ fn compact_strided<T: Number>(
 /// The MLE of a `[C_pot, H_s_pot, W_s_pot]` tensor is evaluated at a point with
 /// `log2(C_pot * H_s_pot * W_s_pot)` coordinates (LSB first, packed as `r_W || r_H || r_C`).
 ///
-/// We expand to the full-res `[C_pot, H_full_pot, W_full_pot]` point by inserting
-/// `log2(stride)` zero coordinates at the LSB of each spatial dimension, matching the
-/// bit structure `stride*h_s` = `h_s` shifted left by `log2(stride)`.
+/// We expand to the full-res `[C_pot, n_x, n_x]` point (where `n_x` is the actual
+/// POT-padded FFT spatial dimension).
 ///
-/// This is sound: `compact.evaluate(r_s) == full_cleared.evaluate(expand(r_s))` because
-/// the full-res tensor has zeros at all non-stride positions.
+/// The expansion maps compact coordinate `h` (in `log_hs` bits) to full-res coordinate
+/// `j = h * stride` (in `log_nx` bits), using the LSB-first bit layout:
+///
+///   compact h:   h_0 h_1 ... h_{log_hs-1}
+///   full j=h*s:  [0]*stride_bits  h_0 ... h_{log_hs-1}  [0]*overflow_bits
+///
+/// where `stride_bits = log2(stride)` and `overflow_bits = log_nx - log_hs - stride_bits`.
+///
+/// The zero bits at the LSB come from the stride factor (stride-multiples have low bits=0).
+/// The zero bits at the MSB come from POT-padding: h_s_pot * stride may be < n_x, so
+/// high bits of j are always zero.
+///
+/// `n_x` is the actual FFT spatial dimension: `next_pow2(H_in + 2*ph)`.  This may be
+/// strictly larger than `h_s_pot * stride` when ONNX spatial padding is non-zero.
+///
+/// Soundness: `compact.evaluate(r_s) == full_cleared.evaluate(expand(r_s))` because
+/// the full-res tensor has zeros at all non-stride positions (and garbage positions).
 fn expand_strided_point<E: ExtensionField>(
     r_strided: &[E],
     c_pot: usize,
     h_s_pot: usize,
     w_s_pot: usize,
+    n_x: usize,
     stride: usize,
 ) -> Vec<E> {
-    debug_assert!(stride.is_power_of_two(), "stride must be power of two");
-    let stride_bits = stride.ilog2() as usize;
+    debug_assert!(n_x.is_power_of_two(), "n_x must be a power of two");
+    debug_assert!(stride.is_power_of_two(), "stride must be a power of two");
+    debug_assert!(
+        n_x >= h_s_pot * stride,
+        "n_x ({n_x}) must be >= h_s_pot * stride ({} * {} = {})",
+        h_s_pot,
+        stride,
+        h_s_pot * stride,
+    );
+    debug_assert!(
+        n_x >= w_s_pot * stride,
+        "n_x ({n_x}) must be >= w_s_pot * stride ({} * {} = {})",
+        w_s_pot,
+        stride,
+        w_s_pot * stride,
+    );
     let log_c = c_pot.ilog2() as usize;
     let log_ws = w_s_pot.ilog2() as usize;
     let log_hs = h_s_pot.ilog2() as usize;
+    let log_nx = n_x.ilog2() as usize;
+    let stride_bits = stride.ilog2() as usize;
+    // Overflow bits: high bits of j that are always zero because h_s_pot * stride <= n_x.
+    let overflow_bits_h = log_nx - log_hs - stride_bits;
+    let overflow_bits_w = log_nx - log_ws - stride_bits;
 
     // r_strided layout (LSB first): r_W[0..log_ws] | r_H[0..log_hs] | r_C[0..log_c]
     let r_w_s = &r_strided[..log_ws];
@@ -2110,22 +2315,27 @@ fn expand_strided_point<E: ExtensionField>(
     let r_c = &r_strided[log_ws + log_hs..];
     debug_assert_eq!(r_c.len(), log_c);
 
-    // Full-res layout: r_W_full[0..log_ws+stride_bits] | r_H_full[..] | r_C[..]
-    // Expand: prepend `stride_bits` zeros to each spatial dim (at the LSB end)
-    let log_wf = log_ws + stride_bits;
-    let log_hf = log_hs + stride_bits;
-
-    let mut r_full: Vec<E> = Vec::with_capacity(log_wf + log_hf + log_c);
-    // W part: [0]*stride_bits ++ r_w_s
+    // Full-res layout: r_W_full[0..log_nx] | r_H_full[0..log_nx] | r_C[0..log_c]
+    //
+    // W expansion: [0]*stride_bits | r_w_s | [0]*overflow_bits_w
+    // H expansion: [0]*stride_bits | r_h_s | [0]*overflow_bits_h
+    let mut r_full: Vec<E> = Vec::with_capacity(log_nx + log_nx + log_c);
+    // W part: stride zeros at LSB, then compact bits, then overflow zeros at MSB
     for _ in 0..stride_bits {
         r_full.push(E::ZERO);
     }
     r_full.extend_from_slice(r_w_s);
-    // H part: [0]*stride_bits ++ r_h_s
+    for _ in 0..overflow_bits_w {
+        r_full.push(E::ZERO);
+    }
+    // H part: stride zeros at LSB, then compact bits, then overflow zeros at MSB
     for _ in 0..stride_bits {
         r_full.push(E::ZERO);
     }
     r_full.extend_from_slice(r_h_s);
+    for _ in 0..overflow_bits_h {
+        r_full.push(E::ZERO);
+    }
     // C part: unchanged
     r_full.extend_from_slice(r_c);
 
@@ -2709,8 +2919,10 @@ mod test {
         // Evaluate compact MLE at r_s
         let compact_eval: E = compact_fields.get_data().to_vec().into_mle().evaluate(&r_s);
 
-        // Expand point and evaluate full-res MLE
-        let r_full = expand_strided_point::<E>(&r_s, c_pot, h_s_pot, w_s_pot, stride);
+        // Expand point and evaluate full-res MLE.
+        // n_x is the actual full-res spatial dimension (= full_pot[1] = 4).
+        let n_x = full_pot[1]; // 4
+        let r_full = expand_strided_point::<E>(&r_s, c_pot, h_s_pot, w_s_pot, n_x, stride);
         let full_eval: E = full_fields.get_data().to_vec().into_mle().evaluate(&r_full);
 
         assert_eq!(

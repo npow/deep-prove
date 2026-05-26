@@ -2119,6 +2119,7 @@ impl<T> Tensor<T> {
     Deserialize,
     PartialEq,
     Eq,
+    Default,
 )]
 pub struct Shape(Vec<usize>);
 
